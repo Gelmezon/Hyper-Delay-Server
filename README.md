@@ -6,7 +6,7 @@
 
 - **多协程时间轮**：Tokio 驱动的轮式调度器，10ms 级别 tick，批量推进，任务触发延迟可控。
 - **持久化恢复**：任务在写入时间轮前会落盘到 sled（WAL + B+Tree），服务重启后读取历史记录并重新入轮。
-- **双工长连接**：每个接入方使用 TCP 长连接发送 `schedule` 请求并接收回调 `delivery`；支持显式 `register` 与自动 ACK。
+- **双工长连接**：gRPC 双向流（`DelayScheduler.Connect`）保持 HTTP/2 连接，客户端发送注册、调度、ACK，一条连接即可推送/拉取事件。
 - **安全控制**：`config.json` 中的 `allowed_hosts` 限定可访问 IP，默认仅允许本机；后续可扩展 token 鉴权。
 - **压缩/格式**：payload 支持标记 `compression`（目前示例使用 `none`，可扩展到 LZ4/Zstd）。
 - **语言无关**：任何语言只需按协议发送 JSON 即可；仓库内提供了 Java Netty 客户端示例。
@@ -18,7 +18,7 @@
 │   ├── config.rs        # 配置模型与白名单校验
 │   ├── persistence.rs   # sled 存储抽象（写入、删除、恢复）
 │   ├── timer.rs         # 时间轮实现
-│   ├── transport.rs     # TCP 服务、协议解析、连接管理
+│   ├── transport.rs     # gRPC 服务与连接管理
 │   ├── types.rs         # 协议与内部数据结构
 │   └── main.rs          # 程序入口，初始化所有组件
 ├── config.json          # 运行时配置
@@ -53,9 +53,9 @@ cargo run --release
 
 ## 时间轮运行逻辑
 
-1. **接收请求**：客户端通过 TCP 连接发送 `schedule` JSON。服务端解析后：
-   - 校验时间（`fire_at`）与 payload。
-   - 将任务转换为内部 `ScheduledTask`，附带 `route_key`（用于回调路由）。
+1. **接收请求**：客户端通过 gRPC `DelayScheduler.Connect` 长连接发送 `ClientMessage`（`Register`/`Schedule`）。服务端解析后：
+  - 校验时间（`fire_at_epoch_ms`）与 payload。
+  - 将任务转换为内部 `ScheduledTask`，附带 `route_key`（用于回调路由）。
 2. **持久化**：`persistence::persist_task` 把任务写入 sled，只有写成功才视为接收成功。
 3. **入轮**：`timer::TimerWheel` 按 `fire_at_epoch_ms` 放入 BTreeMap 槽位。后台 `tick` 每 `tick_ms` 触发，取出到期槽并把任务推入 `ready` 队列。
 4. **回调投递**：`transport::spawn_ready_dispatcher` 消费 `ready` 队列，通过 `ConnectionRegistry` 找到对应连接并发送 `delivery`。
@@ -63,291 +63,123 @@ cargo run --release
    - 投递失败（连接断开等）→ 任务克隆并延迟 `retry_delay_ms` 重新入轮，直到客户端重新注册。
 5. **重启恢复**：`main::rehydrate_tasks` 启动时加载 sled 所有待执行任务，重新入轮（仍保留原 `route_key`）。客户端重连并重新 `register` 后即可继续接收。
 
-## 协议说明（JSON 行分隔）
+## gRPC 协议（`proto/delay.proto`）
 
-### Register
-```json
-{"kind":"register","route_key":"service-A"}
-```
-- 客户端连接建立后立即发送，用于标记回调路由。
-- 服务端响应：`{"kind":"registered","route_key":"service-A"}`
+客户端与服务端通过 `DelayScheduler.Connect(stream ClientMessage)` 建立单个双向流：
 
-### Schedule
-```json
-{
-  "kind": "schedule",
-  "id": "可选/UUID",
-  "route_key": "service-A",
-  "fire_at": 1732616400000,
-  "compression": "none",
-  "payload_base64": "..."
-}
-```
-- `fire_at` 为 Unix epoch 毫秒。
-- `route_key` 决定回调目标；未提供时服务端可回退为 `conn-<id>`。
-- 返回：`{"kind":"ack","id":"...","fire_at":...}`
+- `ClientMessage.register`：连接建立后立刻发送，告诉服务端 `route_key`。
+- `ServerMessage.registered`：服务端确认并完成路由绑定。
+- `ClientMessage.schedule`：包含 `id`（可空）、`fire_at_epoch_ms`、payload bytes、`compression`、`route_key`。
+- `ServerMessage.ack`：每个 schedule 后返回，携带分配的 `id` 与 `fire_at_epoch_ms`。
+- `ServerMessage.delivery`：时间轮触发后推送，包含 payload、`compression` 与 `route_key`。
+- `ClientMessage.ack`：客户端收到 delivery 后发送，用于清理 sled 记录。
+- `ServerMessage.error`：解析/路由失败时返回，客户端可根据需要重试。 
 
-### Delivery & Ack
-```json
-{"kind":"delivery","id":"...","route_key":"service-A","fire_at":"...","payload_base64":"...","compression":"none"}
-{"kind":"ack","id":"..."}
-```
-- 服务端发送 `delivery`，客户端消费后应发送 `ack`，服务端收到 ack 后删除持久化条目。
+压缩字段使用 proto 枚举（`COMPRESSION_NONE`/`COMPRESSION_LZ4`），由客户端在 schedule 前压缩和 base64 编码逻辑交由上层实现。protocol buffer 位置在 `proto/delay.proto`，可用 `protoc`/`tonic-build` 生成语言对应的 stub。
 
-## 接入示例（Java / Netty）
+## 接入示例（gRPC）
 
-### DelayNettyClient 工具类
+### Java gRPC 客户端
 
 ```java
 package com.example.delay;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.SocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.LineBasedFrameDecoder;
-import io.netty.handler.codec.string.StringDecoder;
-import io.netty.handler.codec.string.StringEncoder;
-import io.netty.util.CharsetUtil;
+import com.example.delay.proto.AckRequest;
+import com.example.delay.proto.ClientMessage;
+import com.example.delay.proto.Compression;
+import com.example.delay.proto.DelaySchedulerGrpc;
+import com.example.delay.proto.Delivery;
+import com.example.delay.proto.RegisterRequest;
+import com.example.delay.proto.ScheduleRequest;
+import com.example.delay.proto.ServerMessage;
+import com.google.protobuf.ByteString;
+import io.grpc.ManagedChannel;
+import io.grpc.ManagedChannelBuilder;
+import io.grpc.stub.StreamObserver;
 
 import java.io.Closeable;
-import java.net.InetSocketAddress;
-import java.time.Instant;
-import java.util.Base64;
 import java.util.UUID;
-import java.util.concurrent.*;
 import java.util.function.Consumer;
 
-public class DelayNettyClient implements Closeable {
-  private final String host;
-  private final int port;
+public class DelayGrpcClient implements Closeable {
+  private final ManagedChannel channel;
+  private final DelaySchedulerGrpc.DelaySchedulerStub stub;
+  private final StreamObserver<ClientMessage> requestObserver;
   private final String routeKey;
-  private final Consumer<ReadyMessage> readyHandler;
-  private final ObjectMapper mapper = new ObjectMapper();
+  private final Consumer<Delivery> handler;
 
-  private final Bootstrap bootstrap;
-  private final NioEventLoopGroup group = new NioEventLoopGroup(1);
-  private volatile Channel channel;
-  private final ScheduledExecutorService reconnectExec = Executors.newSingleThreadScheduledExecutor(r -> {
-    Thread t = new Thread(r, "delay-client-reconnect");
-    t.setDaemon(true);
-    return t;
-  });
-  private final long initialReconnectMs;
-  private volatile long currentBackoffMs;
-  private final long maxBackoffMs = 30_000;
-  private volatile boolean closed = false;
-
-  public DelayNettyClient(String host, int port, String routeKey, Consumer<ReadyMessage> readyHandler) {
-    this(host, port, routeKey, readyHandler, 2000);
-  }
-
-  public DelayNettyClient(String host, int port, String routeKey, Consumer<ReadyMessage> readyHandler, long initialReconnectMs) {
-    this.host = host;
-    this.port = port;
+  public DelayGrpcClient(
+      String host,
+      int port,
+      String routeKey,
+      Consumer<Delivery> handler) {
+    this.channel = ManagedChannelBuilder.forAddress(host, port).usePlaintext().build();
+    this.stub = DelaySchedulerGrpc.newStub(channel);
     this.routeKey = routeKey;
-    this.readyHandler = readyHandler;
-    this.initialReconnectMs = initialReconnectMs;
-    this.currentBackoffMs = initialReconnectMs;
+    this.handler = handler;
 
-    bootstrap = new Bootstrap()
-        .group(group)
-        .channel(NioSocketChannel.class)
-        .option(ChannelOption.SO_KEEPALIVE, true)
-        .remoteAddress(new InetSocketAddress(host, port))
-        .handler(new ChannelInitializer<SocketChannel>() {
-          @Override
-          protected void initChannel(SocketChannel ch) {
-            ChannelPipeline p = ch.pipeline();
-            p.addLast(new LineBasedFrameDecoder(64 * 1024));
-            p.addLast(new StringDecoder(CharsetUtil.UTF_8));
-            p.addLast(new StringEncoder(CharsetUtil.UTF_8));
-            p.addLast(new DelayClientHandler());
-          }
-        });
+    this.requestObserver = stub.connect(new StreamObserver<ServerMessage>() {
+      @Override
+      public void onNext(ServerMessage serverMessage) {
+        if (serverMessage.hasDelivery()) {
+          Delivery delivery = serverMessage.getDelivery();
+          handler.accept(delivery);
+          requestObserver.onNext(ClientMessage.newBuilder()
+              .setAck(AckRequest.newBuilder().setId(delivery.getId()).build())
+              .build());
+        }
+      }
 
-    connect();
-  }
+      @Override
+      public void onError(Throwable t) {
+        // 可加入重连逻辑
+      }
 
-  private void connect() {
-    if (closed) {
-      return;
-    }
-    bootstrap.connect().addListener((ChannelFutureListener) future -> {
-      if (future.isSuccess()) {
-        channel = future.channel();
-        currentBackoffMs = initialReconnectMs;
-      } else {
-        scheduleReconnect();
+      @Override
+      public void onCompleted() {
+        // 服务端主动关闭
       }
     });
+
+    requestObserver.onNext(ClientMessage.newBuilder()
+        .setRegister(RegisterRequest.newBuilder().setRouteKey(routeKey).build())
+        .build());
   }
 
-  private void scheduleReconnect() {
-    if (closed) {
-      return;
-    }
-    long delay = Math.min(currentBackoffMs, maxBackoffMs);
-    reconnectExec.schedule(this::connect, delay, TimeUnit.MILLISECONDS);
-    currentBackoffMs = Math.min(maxBackoffMs, currentBackoffMs * 2);
-  }
-
-  public void scheduleAt(long epochMillis, byte[] payload) {
-    ScheduleMessage msg = new ScheduleMessage();
-    msg.kind = "schedule";
-    msg.routeKey = routeKey;
-    msg.fireAt = epochMillis;
-    msg.id = UUID.randomUUID().toString();
-    msg.compression = "none";
-    msg.payloadBase64 = Base64.getEncoder().encodeToString(payload);
-    sendJson(msg);
-  }
-
-  private void sendJson(Object obj) {
-    try {
-      String s = mapper.writeValueAsString(obj) + "\n";
-      Channel ch = channel;
-      if (ch != null && ch.isActive()) {
-        ch.writeAndFlush(s);
-      }
-    } catch (Exception ignored) {
-    }
+  public void scheduleAt(long fireAtEpochMs, byte[] payload) {
+    ScheduleRequest request = ScheduleRequest.newBuilder()
+        .setId(UUID.randomUUID().toString())
+        .setRouteKey(routeKey)
+        .setFireAtEpochMs(fireAtEpochMs)
+        .setPayload(ByteString.copyFrom(payload))
+        .setCompression(Compression.COMPRESSION_NONE)
+        .build();
+    requestObserver.onNext(ClientMessage.newBuilder().setSchedule(request).build());
   }
 
   @Override
   public void close() {
-    closed = true;
-    try {
-      if (channel != null) {
-        channel.close().syncUninterruptibly();
-      }
-    } catch (Exception ignored) {
-    }
-    try {
-      group.shutdownGracefully().syncUninterruptibly();
-    } catch (Exception ignored) {
-    }
-    reconnectExec.shutdownNow();
-  }
-
-  private class DelayClientHandler extends SimpleChannelInboundHandler<String> {
-    @Override
-    public void channelActive(ChannelHandlerContext ctx) {
-      RegisterMessage reg = new RegisterMessage("register", routeKey);
-      try {
-        String s = mapper.writeValueAsString(reg) + "\n";
-        ctx.writeAndFlush(s);
-      } catch (Exception ignored) {
-      }
-    }
-
-    @Override
-    public void channelInactive(ChannelHandlerContext ctx) {
-      channel = null;
-      if (!closed) {
-        scheduleReconnect();
-      }
-    }
-
-    @Override
-    protected void channelRead0(ChannelHandlerContext ctx, String line) {
-      try {
-        GenericMessage gm = mapper.readValue(line, GenericMessage.class);
-        if ("ready".equals(gm.kind)) {
-          ReadyMessage ready = mapper.readValue(line, ReadyMessage.class);
-          CompletableFuture.runAsync(() -> {
-            try {
-              readyHandler.accept(ready);
-            } catch (Throwable ignored) {
-            }
-          });
-          AckMessage ack = new AckMessage("ack", ready.id);
-          sendJson(ack);
-        }
-      } catch (Exception ignored) {
-      }
-    }
-
-    @Override
-    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-      ctx.close();
-    }
-  }
-
-  private static class GenericMessage {
-    public String kind;
-  }
-
-  private static class RegisterMessage {
-    public final String kind;
-    @JsonProperty("route_key")
-    public final String routeKey;
-
-    RegisterMessage(String kind, String routeKey) {
-      this.kind = kind;
-      this.routeKey = routeKey;
-    }
-  }
-
-  private static class ScheduleMessage {
-    public String kind;
-    @JsonProperty("route_key")
-    public String routeKey;
-    @JsonProperty("fire_at")
-    public long fireAt;
-    public String id;
-    public String compression;
-    @JsonProperty("payload_base64")
-    public String payloadBase64;
-  }
-
-  public static class ReadyMessage {
-    public String kind;
-    public String id;
-    @JsonProperty("route_key")
-    public String routeKey;
-    @JsonProperty("fire_at")
-    public long fireAt;
-    @JsonProperty("payload_base64")
-    public String payloadBase64;
-
-    public byte[] decodePayload() {
-      return Base64.getDecoder().decode(payloadBase64);
-    }
-  }
-
-  private static class AckMessage {
-    public String kind;
-    public String id;
-
-    AckMessage(String kind, String id) {
-      this.kind = kind;
-      this.id = id;
-    }
+    requestObserver.onCompleted();
+    channel.shutdownNow();
   }
 }
 ```
 
-- 负责：自动重连、连接注册、schedule 发送、ready 回调与 ACK。
-- 可继续扩展鉴权、心跳、payload 压缩等能力。
+- 负责：建立 gRPC 双向流、注册 `route_key`、处理 `delivery` 并发送 ACK、提供 `scheduleAt` 调度接口。
 
 ### Spring Bean 使用示例
 
 ```java
 @Bean(destroyMethod = "close")
-public DelayNettyClient delayClient() {
-  return new DelayNettyClient("127.0.0.1", 7000, "my-service-1", ready -> {
-    byte[] payload = ready.decodePayload();
+public DelayGrpcClient delayClient() {
+  return new DelayGrpcClient("127.0.0.1", 7000, "my-service-1", delivery -> {
+    byte[] payload = delivery.getPayload().toByteArray();
     // TODO: 反序列化并执行业务逻辑
-    log.info("task {} fireAt {}", ready.id, Instant.ofEpochMilli(ready.fireAt));
+    log.info("task {} fireAt {}", delivery.getId(), Instant.ofEpochMilli(delivery.getFireAtEpochMs()));
   });
 }
 ```
-- 连接成功后自动注册 `route_key`，调用 `scheduleAt(epochMillis, payload)` 即可提交任务。
-- 在 Spring 中注册为单例 Bean，调用方注入后直接使用即可。
+```
 
 ### Go 客户端示例
 
@@ -355,179 +187,79 @@ public DelayNettyClient delayClient() {
 package delayclient
 
 import (
-  "bufio"
   "context"
-  "encoding/base64"
-  "encoding/json"
-  "errors"
-  "net"
   "sync"
   "time"
+
+  "github.com/example/delay/proto"
+  "github.com/google/uuid"
+  "google.golang.org/grpc"
 )
 
 type Client struct {
-  addr      string
-  routeKey  string
-  handler   func(ReadyMessage)
-  conn      net.Conn
-  mu        sync.Mutex
-  closeOnce sync.Once
+  routeKey string
+  stream   proto.DelayScheduler_ConnectClient
+  cancel   context.CancelFunc
+  mu       sync.Mutex
 }
 
-type envelope struct {
-  Kind string `json:"kind"`
-}
-
-type registerMessage struct {
-  Kind     string `json:"kind"`
-  RouteKey string `json:"route_key"`
-}
-
-type scheduleMessage struct {
-  Kind          string `json:"kind"`
-  RouteKey      string `json:"route_key"`
-  FireAt        int64  `json:"fire_at"`
-  ID            string `json:"id"`
-  Compression   string `json:"compression"`
-  PayloadBase64 string `json:"payload_base64"`
-}
-
-type ackMessage struct {
-  Kind string `json:"kind"`
-  ID   string `json:"id"`
-}
-
-type ReadyMessage struct {
-  Kind          string `json:"kind"`
-  ID            string `json:"id"`
-  RouteKey      string `json:"route_key"`
-  FireAt        int64  `json:"fire_at"`
-  PayloadBase64 string `json:"payload_base64"`
-}
-
-func (r ReadyMessage) DecodePayload() ([]byte, error) {
-  return base64.StdEncoding.DecodeString(r.PayloadBase64)
-}
-
-func New(addr, routeKey string, handler func(ReadyMessage)) (*Client, error) {
-  conn, err := net.Dial("tcp", addr)
+func New(addr, routeKey string, handler func(*proto.Delivery)) (*Client, error) {
+  conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock())
   if err != nil {
     return nil, err
   }
-  c := &Client{
-    addr:     addr,
-    routeKey: routeKey,
-    handler:  handler,
-    conn:     conn,
-  }
-  if err := c.send(registerMessage{Kind: "register", RouteKey: routeKey}); err != nil {
-    conn.Close()
+  ctx, cancel := context.WithCancel(context.Background())
+  client := proto.NewDelaySchedulerClient(conn)
+  stream, err := client.Connect(ctx)
+  if err != nil {
+    cancel()
     return nil, err
   }
-  go c.readLoop()
+  c := &Client{routeKey: routeKey, stream: stream, cancel: cancel}
+  go c.readLoop(handler)
+  if err := c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Register{
+    Register: &proto.RegisterRequest{RouteKey: routeKey},
+  }}); err != nil {
+    return nil, err
+  }
   return c, nil
 }
 
-func (c *Client) Schedule(ctx context.Context, fireAt time.Time, payload []byte, id string) error {
-  if id == "" {
-    return errors.New("id required")
-  }
-  msg := scheduleMessage{
-    Kind:          "schedule",
-    RouteKey:      c.routeKey,
-    FireAt:        fireAt.UnixMilli(),
-    ID:            id,
-    Compression:   "none",
-    PayloadBase64: base64.StdEncoding.EncodeToString(payload),
-  }
-  return c.sendWithContext(ctx, msg)
-}
-
-func (c *Client) Close() error {
-  var err error
-  c.closeOnce.Do(func() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    if c.conn != nil {
-      err = c.conn.Close()
-    }
-  })
-  return err
-}
-
-func (c *Client) sendWithContext(ctx context.Context, msg any) error {
-  done := make(chan error, 1)
-  go func() {
-    done <- c.send(msg)
-  }()
-  select {
-  case <-ctx.Done():
-    return ctx.Err()
-  case err := <-done:
-    return err
-  }
-}
-
-func (c *Client) send(msg any) error {
-  data, err := json.Marshal(msg)
-  if err != nil {
-    return err
-  }
-  data = append(data, '\n')
+func (c *Client) ScheduleAt(fireAt time.Time, payload []byte) error {
   c.mu.Lock()
   defer c.mu.Unlock()
-  if c.conn == nil {
-    return errors.New("connection closed")
-  }
-  _, err = c.conn.Write(data)
-  return err
+  return c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Schedule{
+    Schedule: &proto.ScheduleRequest{
+      Id:             uuid.New().String(),
+      FireAtEpochMs:  fireAt.UnixMilli(),
+      Payload:        payload,
+      Compression:    proto.Compression_COMPRESSION_NONE,
+      RouteKey:       c.routeKey,
+    },
+  }})
 }
 
-func (c *Client) readLoop() {
-  scanner := bufio.NewScanner(c.conn)
-  for scanner.Scan() {
-    line := scanner.Bytes()
-    var env envelope
-    if err := json.Unmarshal(line, &env); err != nil {
-      continue
-    }
-    if env.Kind != "delivery" {
-      continue
-    }
-    var ready ReadyMessage
-    if err := json.Unmarshal(line, &ready); err != nil {
-      continue
-    }
-    go c.handler(ready)
-    _ = c.send(ackMessage{Kind: "ack", ID: ready.ID})
-  }
-  c.Close()
+func (c *Client) Close() {
+  c.cancel()
 }
-```
 
-```go
-// 使用示例
-func main() {
-  client, err := delayclient.New("127.0.0.1:7000", "go-worker-1", func(msg delayclient.ReadyMessage) {
-    payload, _ := msg.DecodePayload()
-    log.Printf("fire %s payload=%s", msg.ID, string(payload))
-  })
-  if err != nil {
-    log.Fatal(err)
+func (c *Client) readLoop(handler func(*proto.Delivery)) {
+  for {
+    msg, err := c.stream.Recv()
+    if err != nil {
+      return
+    }
+    if delivery := msg.GetDelivery(); delivery != nil {
+      handler(delivery)
+      _ = c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Ack{
+        Ack: &proto.AckRequest{Id: delivery.GetId()},
+      }})
+    }
   }
-  defer client.Close()
-
-  ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-  defer cancel()
-  if err := client.Schedule(ctx, time.Now().Add(5*time.Second), []byte("hello"), "task-1"); err != nil {
-    log.Fatal(err)
-  }
-
-  select {}
 }
 ```
-- Go 示例展示了最小化长连接客户端：启动后注册 routeKey、监听 delivery、发送 ack，并提供 `Schedule` 方法提交任务。
-- 实际生产可在 `readLoop` 中加入自动重连、心跳和 payload 解密/解压等逻辑。
+
+- Go gRPC 示例：建立 `Connect` 流、注册 `routeKey`、启动 `readLoop` 消费 `Delivery` 并自动回 ACK；调用 `ScheduleAt` 提交任务。
 
 ## 常见扩展
 

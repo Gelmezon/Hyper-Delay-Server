@@ -9,6 +9,7 @@ bytes = "1.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_bytes = "0.11"
+futures-core = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
 anyhow = "1.0"
 thiserror = "1.0"
@@ -17,3 +18,9 @@ lz4_flex = { version = "0.11", features = ["std"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.10", features = ["v4", "fast-rng", "serde"] }
+tonic = { version = "0.11", features = ["transport"] }
+prost = "0.12"
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.11"

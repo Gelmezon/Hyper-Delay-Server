@@ -1,22 +1,27 @@
 // 程序入口：负责初始化依赖并启动所有后台任务
 mod config;
+mod pb;
 mod persistence;
 mod timer;
 mod transport;
 mod types;
 
 use std::env;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use tokio::sync::mpsc;
+use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
+use pb::delay;
 use persistence::SledStorage;
 use timer::TimerWheel;
+use transport::{ConnectionHub, DelaySchedulerService, spawn_ready_dispatcher};
 use types::PersistedTask;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -39,20 +44,24 @@ async fn main() -> anyhow::Result<()> {
     wheel.clone().start();
 
     // ConnectionHub 负责维护长连接、协议解析与回调分发
-    let hub = Arc::new(transport::ConnectionHub::new(
-        wheel.clone(),
-        storage.clone(),
-        app_config.clone(),
-    ));
-    transport::spawn_ready_dispatcher(
+    let hub = Arc::new(ConnectionHub::new(wheel.clone(), storage.clone()));
+    spawn_ready_dispatcher(
         ready_rx,
         hub.registry(),
-        storage.clone(),
         wheel.clone(),
         app_config.retry_delay_ms,
     );
 
-    hub.run(&app_config.bind_addr).await
+    let service = DelaySchedulerService::new(hub.clone(), app_config.clone());
+    let addr: SocketAddr = app_config.bind_addr.parse().context("parse bind addr")?;
+    Server::builder()
+        .add_service(delay::delay_scheduler_server::DelaySchedulerServer::new(
+            service,
+        ))
+        .serve(addr)
+        .await?;
+
+    Ok(())
 }
 
 async fn rehydrate_tasks(storage: Arc<SledStorage>, wheel: Arc<TimerWheel>) -> anyhow::Result<()> {

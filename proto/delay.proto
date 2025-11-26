@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package delay;
+
+option java_package = "com.example.delay.proto";
+option java_multiple_files = true;
+option go_package = "github.com/example/delay/proto";
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_LZ4 = 1;
+}
+
+message RegisterRequest {
+  string route_key = 1;
+}
+
+message ScheduleRequest {
+  string id = 1;
+  uint64 fire_at_epoch_ms = 2;
+  bytes payload = 3;
+  Compression compression = 4;
+  string route_key = 5;
+}
+
+message AckRequest {
+  string id = 1;
+}
+
+message AckResponse {
+  string id = 1;
+  uint64 fire_at_epoch_ms = 2;
+}
+
+message Delivery {
+  string id = 1;
+  uint64 fire_at_epoch_ms = 2;
+  bytes payload = 3;
+  Compression compression = 4;
+  string route_key = 5;
+}
+
+message Registered {
+  string route_key = 1;
+}
+
+message ErrorResponse {
+  string message = 1;
+}
+
+message ClientMessage {
+  oneof message {
+    RegisterRequest register = 1;
+    ScheduleRequest schedule = 2;
+    AckRequest ack = 3;
+  }
+}
+
+message ServerMessage {
+  oneof message {
+    AckResponse ack = 1;
+    Delivery delivery = 2;
+    Registered registered = 3;
+    ErrorResponse error = 4;
+  }
+}
+
+service DelayScheduler {
+  rpc Connect(stream ClientMessage) returns (stream ServerMessage);
+}

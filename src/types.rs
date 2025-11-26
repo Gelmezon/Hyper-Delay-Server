@@ -1,9 +1,11 @@
+use anyhow::Context;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+use crate::pb::delay;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,63 +38,13 @@ impl Compression {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScheduleRequest {
-    #[serde(default = "Uuid::nil", skip_serializing_if = "Uuid::is_nil")]
-    pub id: Uuid,
-    pub fire_at_epoch_ms: u64,
-    #[serde(with = "serde_bytes")]
-    pub payload: Vec<u8>,
-    #[serde(default)]
-    pub compression: Option<Compression>,
-    #[serde(default)]
-    pub route_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AckResponse {
-    pub id: Uuid,
-    pub fire_at_epoch_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterAck {
-    pub route_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeliveryPayload {
-    pub id: Uuid,
-    pub fire_at_epoch_ms: u64,
-    #[serde(with = "serde_bytes")]
-    pub payload: ByteBuf,
-    pub compression: Compression,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ErrorResponse {
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    pub route_key: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum InboundMessage {
-    Schedule(ScheduleRequest),
-    Register(RegisterRequest),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OutboundMessage {
-    Ack(AckResponse),
-    Delivery(DeliveryPayload),
-    Error(ErrorResponse),
-    Registered(RegisterAck),
+impl From<delay::Compression> for Compression {
+    fn from(value: delay::Compression) -> Self {
+        match value {
+            delay::Compression::Lz4 => Compression::Lz4,
+            _ => Compression::None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,22 +57,22 @@ pub struct ScheduledTask {
 }
 
 impl ScheduledTask {
-    pub fn from_request(req: ScheduleRequest, connection_id: u64) -> anyhow::Result<Self> {
-        let id = if req.id.is_nil() {
+    pub fn from_proto(req: &delay::ScheduleRequest, connection_id: u64) -> anyhow::Result<Self> {
+        let id = if req.id.is_empty() {
             Uuid::new_v4()
         } else {
-            req.id
+            Uuid::parse_str(&req.id).context("parse request id")?
         };
-        let compression = req.compression.unwrap_or_default();
-        let bytes = Bytes::from(req.payload);
-        let route_key = req
-            .route_key
-            .unwrap_or_else(|| format!("conn-{connection_id}"));
+        let route_key = if req.route_key.is_empty() {
+            format!("conn-{connection_id}")
+        } else {
+            req.route_key.clone()
+        };
         Ok(Self {
             id,
             fire_at_epoch_ms: req.fire_at_epoch_ms,
-            payload: bytes,
-            compression,
+            payload: Bytes::from(req.payload.clone()),
+            compression: Compression::from(req.compression()),
             route_key,
         })
     }

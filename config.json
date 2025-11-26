@@ -1,0 +1,9 @@
+{
+  "data_dir": "data/db",
+  "bind_addr": "127.0.0.1:7000",
+  "tick_ms": 10,
+  "ready_channel_capacity": 2048,
+  "connection_write_channel": 256,
+  "retry_delay_ms": 1000,
+  "allowed_hosts": ["127.0.0.1", "::1"]
+}

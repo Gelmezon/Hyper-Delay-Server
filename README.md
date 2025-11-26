@@ -96,18 +96,438 @@ cargo run --release
 
 ## 接入示例（Java / Netty）
 
+### DelayNettyClient 工具类
+
+```java
+package com.example.delay;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.SocketChannel;
+import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.LineBasedFrameDecoder;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.codec.string.StringEncoder;
+import io.netty.util.CharsetUtil;
+
+import java.io.Closeable;
+import java.net.InetSocketAddress;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.UUID;
+import java.util.concurrent.*;
+import java.util.function.Consumer;
+
+public class DelayNettyClient implements Closeable {
+  private final String host;
+  private final int port;
+  private final String routeKey;
+  private final Consumer<ReadyMessage> readyHandler;
+  private final ObjectMapper mapper = new ObjectMapper();
+
+  private final Bootstrap bootstrap;
+  private final NioEventLoopGroup group = new NioEventLoopGroup(1);
+  private volatile Channel channel;
+  private final ScheduledExecutorService reconnectExec = Executors.newSingleThreadScheduledExecutor(r -> {
+    Thread t = new Thread(r, "delay-client-reconnect");
+    t.setDaemon(true);
+    return t;
+  });
+  private final long initialReconnectMs;
+  private volatile long currentBackoffMs;
+  private final long maxBackoffMs = 30_000;
+  private volatile boolean closed = false;
+
+  public DelayNettyClient(String host, int port, String routeKey, Consumer<ReadyMessage> readyHandler) {
+    this(host, port, routeKey, readyHandler, 2000);
+  }
+
+  public DelayNettyClient(String host, int port, String routeKey, Consumer<ReadyMessage> readyHandler, long initialReconnectMs) {
+    this.host = host;
+    this.port = port;
+    this.routeKey = routeKey;
+    this.readyHandler = readyHandler;
+    this.initialReconnectMs = initialReconnectMs;
+    this.currentBackoffMs = initialReconnectMs;
+
+    bootstrap = new Bootstrap()
+        .group(group)
+        .channel(NioSocketChannel.class)
+        .option(ChannelOption.SO_KEEPALIVE, true)
+        .remoteAddress(new InetSocketAddress(host, port))
+        .handler(new ChannelInitializer<SocketChannel>() {
+          @Override
+          protected void initChannel(SocketChannel ch) {
+            ChannelPipeline p = ch.pipeline();
+            p.addLast(new LineBasedFrameDecoder(64 * 1024));
+            p.addLast(new StringDecoder(CharsetUtil.UTF_8));
+            p.addLast(new StringEncoder(CharsetUtil.UTF_8));
+            p.addLast(new DelayClientHandler());
+          }
+        });
+
+    connect();
+  }
+
+  private void connect() {
+    if (closed) {
+      return;
+    }
+    bootstrap.connect().addListener((ChannelFutureListener) future -> {
+      if (future.isSuccess()) {
+        channel = future.channel();
+        currentBackoffMs = initialReconnectMs;
+      } else {
+        scheduleReconnect();
+      }
+    });
+  }
+
+  private void scheduleReconnect() {
+    if (closed) {
+      return;
+    }
+    long delay = Math.min(currentBackoffMs, maxBackoffMs);
+    reconnectExec.schedule(this::connect, delay, TimeUnit.MILLISECONDS);
+    currentBackoffMs = Math.min(maxBackoffMs, currentBackoffMs * 2);
+  }
+
+  public void scheduleAt(long epochMillis, byte[] payload) {
+    ScheduleMessage msg = new ScheduleMessage();
+    msg.kind = "schedule";
+    msg.routeKey = routeKey;
+    msg.fireAt = epochMillis;
+    msg.id = UUID.randomUUID().toString();
+    msg.compression = "none";
+    msg.payloadBase64 = Base64.getEncoder().encodeToString(payload);
+    sendJson(msg);
+  }
+
+  private void sendJson(Object obj) {
+    try {
+      String s = mapper.writeValueAsString(obj) + "\n";
+      Channel ch = channel;
+      if (ch != null && ch.isActive()) {
+        ch.writeAndFlush(s);
+      }
+    } catch (Exception ignored) {
+    }
+  }
+
+  @Override
+  public void close() {
+    closed = true;
+    try {
+      if (channel != null) {
+        channel.close().syncUninterruptibly();
+      }
+    } catch (Exception ignored) {
+    }
+    try {
+      group.shutdownGracefully().syncUninterruptibly();
+    } catch (Exception ignored) {
+    }
+    reconnectExec.shutdownNow();
+  }
+
+  private class DelayClientHandler extends SimpleChannelInboundHandler<String> {
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+      RegisterMessage reg = new RegisterMessage("register", routeKey);
+      try {
+        String s = mapper.writeValueAsString(reg) + "\n";
+        ctx.writeAndFlush(s);
+      } catch (Exception ignored) {
+      }
+    }
+
+    @Override
+    public void channelInactive(ChannelHandlerContext ctx) {
+      channel = null;
+      if (!closed) {
+        scheduleReconnect();
+      }
+    }
+
+    @Override
+    protected void channelRead0(ChannelHandlerContext ctx, String line) {
+      try {
+        GenericMessage gm = mapper.readValue(line, GenericMessage.class);
+        if ("ready".equals(gm.kind)) {
+          ReadyMessage ready = mapper.readValue(line, ReadyMessage.class);
+          CompletableFuture.runAsync(() -> {
+            try {
+              readyHandler.accept(ready);
+            } catch (Throwable ignored) {
+            }
+          });
+          AckMessage ack = new AckMessage("ack", ready.id);
+          sendJson(ack);
+        }
+      } catch (Exception ignored) {
+      }
+    }
+
+    @Override
+    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+      ctx.close();
+    }
+  }
+
+  private static class GenericMessage {
+    public String kind;
+  }
+
+  private static class RegisterMessage {
+    public final String kind;
+    @JsonProperty("route_key")
+    public final String routeKey;
+
+    RegisterMessage(String kind, String routeKey) {
+      this.kind = kind;
+      this.routeKey = routeKey;
+    }
+  }
+
+  private static class ScheduleMessage {
+    public String kind;
+    @JsonProperty("route_key")
+    public String routeKey;
+    @JsonProperty("fire_at")
+    public long fireAt;
+    public String id;
+    public String compression;
+    @JsonProperty("payload_base64")
+    public String payloadBase64;
+  }
+
+  public static class ReadyMessage {
+    public String kind;
+    public String id;
+    @JsonProperty("route_key")
+    public String routeKey;
+    @JsonProperty("fire_at")
+    public long fireAt;
+    @JsonProperty("payload_base64")
+    public String payloadBase64;
+
+    public byte[] decodePayload() {
+      return Base64.getDecoder().decode(payloadBase64);
+    }
+  }
+
+  private static class AckMessage {
+    public String kind;
+    public String id;
+
+    AckMessage(String kind, String id) {
+      this.kind = kind;
+      this.id = id;
+    }
+  }
+}
+```
+
+- 负责：自动重连、连接注册、schedule 发送、ready 回调与 ACK。
+- 可继续扩展鉴权、心跳、payload 压缩等能力。
+
+### Spring Bean 使用示例
+
 ```java
 @Bean(destroyMethod = "close")
 public DelayNettyClient delayClient() {
-    return new DelayNettyClient("127.0.0.1", 7000, "my-service-1", ready -> {
-        byte[] payload = ready.decodePayload();
-        // TODO: 反序列化并执行业务逻辑
-        log.info("task {} fireAt {}", ready.id, Instant.ofEpochMilli(ready.fireAt));
-    });
+  return new DelayNettyClient("127.0.0.1", 7000, "my-service-1", ready -> {
+    byte[] payload = ready.decodePayload();
+    // TODO: 反序列化并执行业务逻辑
+    log.info("task {} fireAt {}", ready.id, Instant.ofEpochMilli(ready.fireAt));
+  });
 }
 ```
-- `DelayNettyClient` 位于 `com.example.delay`（见上一条回答中的代码）。
-- 连接成功后自动注册 routeKey，`scheduleAt(epochMillis, payload)` 即可向服务端提交任务。
+- 连接成功后自动注册 `route_key`，调用 `scheduleAt(epochMillis, payload)` 即可提交任务。
+- 在 Spring 中注册为单例 Bean，调用方注入后直接使用即可。
+
+### Go 客户端示例
+
+```go
+package delayclient
+
+import (
+  "bufio"
+  "context"
+  "encoding/base64"
+  "encoding/json"
+  "errors"
+  "net"
+  "sync"
+  "time"
+)
+
+type Client struct {
+  addr      string
+  routeKey  string
+  handler   func(ReadyMessage)
+  conn      net.Conn
+  mu        sync.Mutex
+  closeOnce sync.Once
+}
+
+type envelope struct {
+  Kind string `json:"kind"`
+}
+
+type registerMessage struct {
+  Kind     string `json:"kind"`
+  RouteKey string `json:"route_key"`
+}
+
+type scheduleMessage struct {
+  Kind          string `json:"kind"`
+  RouteKey      string `json:"route_key"`
+  FireAt        int64  `json:"fire_at"`
+  ID            string `json:"id"`
+  Compression   string `json:"compression"`
+  PayloadBase64 string `json:"payload_base64"`
+}
+
+type ackMessage struct {
+  Kind string `json:"kind"`
+  ID   string `json:"id"`
+}
+
+type ReadyMessage struct {
+  Kind          string `json:"kind"`
+  ID            string `json:"id"`
+  RouteKey      string `json:"route_key"`
+  FireAt        int64  `json:"fire_at"`
+  PayloadBase64 string `json:"payload_base64"`
+}
+
+func (r ReadyMessage) DecodePayload() ([]byte, error) {
+  return base64.StdEncoding.DecodeString(r.PayloadBase64)
+}
+
+func New(addr, routeKey string, handler func(ReadyMessage)) (*Client, error) {
+  conn, err := net.Dial("tcp", addr)
+  if err != nil {
+    return nil, err
+  }
+  c := &Client{
+    addr:     addr,
+    routeKey: routeKey,
+    handler:  handler,
+    conn:     conn,
+  }
+  if err := c.send(registerMessage{Kind: "register", RouteKey: routeKey}); err != nil {
+    conn.Close()
+    return nil, err
+  }
+  go c.readLoop()
+  return c, nil
+}
+
+func (c *Client) Schedule(ctx context.Context, fireAt time.Time, payload []byte, id string) error {
+  if id == "" {
+    return errors.New("id required")
+  }
+  msg := scheduleMessage{
+    Kind:          "schedule",
+    RouteKey:      c.routeKey,
+    FireAt:        fireAt.UnixMilli(),
+    ID:            id,
+    Compression:   "none",
+    PayloadBase64: base64.StdEncoding.EncodeToString(payload),
+  }
+  return c.sendWithContext(ctx, msg)
+}
+
+func (c *Client) Close() error {
+  var err error
+  c.closeOnce.Do(func() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    if c.conn != nil {
+      err = c.conn.Close()
+    }
+  })
+  return err
+}
+
+func (c *Client) sendWithContext(ctx context.Context, msg any) error {
+  done := make(chan error, 1)
+  go func() {
+    done <- c.send(msg)
+  }()
+  select {
+  case <-ctx.Done():
+    return ctx.Err()
+  case err := <-done:
+    return err
+  }
+}
+
+func (c *Client) send(msg any) error {
+  data, err := json.Marshal(msg)
+  if err != nil {
+    return err
+  }
+  data = append(data, '\n')
+  c.mu.Lock()
+  defer c.mu.Unlock()
+  if c.conn == nil {
+    return errors.New("connection closed")
+  }
+  _, err = c.conn.Write(data)
+  return err
+}
+
+func (c *Client) readLoop() {
+  scanner := bufio.NewScanner(c.conn)
+  for scanner.Scan() {
+    line := scanner.Bytes()
+    var env envelope
+    if err := json.Unmarshal(line, &env); err != nil {
+      continue
+    }
+    if env.Kind != "delivery" {
+      continue
+    }
+    var ready ReadyMessage
+    if err := json.Unmarshal(line, &ready); err != nil {
+      continue
+    }
+    go c.handler(ready)
+    _ = c.send(ackMessage{Kind: "ack", ID: ready.ID})
+  }
+  c.Close()
+}
+```
+
+```go
+// 使用示例
+func main() {
+  client, err := delayclient.New("127.0.0.1:7000", "go-worker-1", func(msg delayclient.ReadyMessage) {
+    payload, _ := msg.DecodePayload()
+    log.Printf("fire %s payload=%s", msg.ID, string(payload))
+  })
+  if err != nil {
+    log.Fatal(err)
+  }
+  defer client.Close()
+
+  ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+  defer cancel()
+  if err := client.Schedule(ctx, time.Now().Add(5*time.Second), []byte("hello"), "task-1"); err != nil {
+    log.Fatal(err)
+  }
+
+  select {}
+}
+```
+- Go 示例展示了最小化长连接客户端：启动后注册 routeKey、监听 delivery、发送 ack，并提供 `Schedule` 方法提交任务。
+- 实际生产可在 `readLoop` 中加入自动重连、心跳和 payload 解密/解压等逻辑。
 
 ## 常见扩展
 

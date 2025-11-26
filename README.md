@@ -89,7 +89,7 @@ cargo run --release
 
 ### Delivery & Ack
 ```json
-{"kind":"delivery","id":"...","route_key":"service-A","fire_at":...,"payload_base64":"...","compression":"none"}
+{"kind":"delivery","id":"...","route_key":"service-A","fire_at":"...","payload_base64":"...","compression":"none"}
 {"kind":"ack","id":"..."}
 ```
 - 服务端发送 `delivery`，客户端消费后应发送 `ack`，服务端收到 ack 后删除持久化条目。

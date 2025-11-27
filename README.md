@@ -181,86 +181,6 @@ public DelayGrpcClient delayClient() {
 ```
 
 
-### Go 客户端示例
-
-```go
-package delayclient
-
-import (
-  "context"
-  "sync"
-  "time"
-
-  "github.com/example/delay/proto"
-  "github.com/google/uuid"
-  "google.golang.org/grpc"
-)
-
-type Client struct {
-  routeKey string
-  stream   proto.DelayScheduler_ConnectClient
-  cancel   context.CancelFunc
-  mu       sync.Mutex
-}
-
-func New(addr, routeKey string, handler func(*proto.Delivery)) (*Client, error) {
-  conn, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock())
-  if err != nil {
-    return nil, err
-  }
-  ctx, cancel := context.WithCancel(context.Background())
-  client := proto.NewDelaySchedulerClient(conn)
-  stream, err := client.Connect(ctx)
-  if err != nil {
-    cancel()
-    return nil, err
-  }
-  c := &Client{routeKey: routeKey, stream: stream, cancel: cancel}
-  go c.readLoop(handler)
-  if err := c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Register{
-    Register: &proto.RegisterRequest{RouteKey: routeKey},
-  }}); err != nil {
-    return nil, err
-  }
-  return c, nil
-}
-
-func (c *Client) ScheduleAt(fireAt time.Time, payload []byte) error {
-  c.mu.Lock()
-  defer c.mu.Unlock()
-  return c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Schedule{
-    Schedule: &proto.ScheduleRequest{
-      Id:             uuid.New().String(),
-      FireAtEpochMs:  fireAt.UnixMilli(),
-      Payload:        payload,
-      Compression:    proto.Compression_COMPRESSION_NONE,
-      RouteKey:       c.routeKey,
-    },
-  }})
-}
-
-func (c *Client) Close() {
-  c.cancel()
-}
-
-func (c *Client) readLoop(handler func(*proto.Delivery)) {
-  for {
-    msg, err := c.stream.Recv()
-    if err != nil {
-      return
-    }
-    if delivery := msg.GetDelivery(); delivery != nil {
-      handler(delivery)
-      _ = c.stream.Send(&proto.ClientMessage{Message: &proto.ClientMessage_Ack{
-        Ack: &proto.AckRequest{Id: delivery.GetId()},
-      }})
-    }
-  }
-}
-```
-
-- Go gRPC 示例：建立 `Connect` 流、注册 `routeKey`、启动 `readLoop` 消费 `Delivery` 并自动回 ACK；调用 `ScheduleAt` 提交任务。
-
 ## 常见扩展
 
 - **压缩**：在客户端压缩 payload（LZ4/Zstd）后 base64，`compression` 字段告诉服务端如何解压。
@@ -277,3 +197,23 @@ func (c *Client) readLoop(handler func(*proto.Delivery)) {
 ---
 
 欢迎根据业务需求继续扩展（如集群化、HTTP API、鉴权等）。如需更多示例或客户端 SDK，请提 Issues。
+
+## 日志含义
+
+- `starting gRPC delay scheduler server`：服务启动并绑定监听地址（来自 `main.rs`）。
+- `accept connection`：连接来源 IP 通过白名单校验，允许进入（`transport.rs`）。
+- `reject connection: host not allowed`：来源 IP 不在 `allowed_hosts`，连接被拒绝（`transport.rs`）。
+- `route registered`：客户端 `register` 成功，已绑定 `route_key`（`transport.rs`）。
+- `task scheduled`：`schedule` 校验通过并持久化，等待到期（`transport.rs`）。
+- `reject schedule: fire_at in the past`：提交的触发时间早于当前时间，被拒；客户端会收到 `ErrorResponse{code="INVALID_FIRE_AT"}`（`transport.rs`）。
+- `reject schedule: fire_at exceeds max delay`：超过 `config.max_delay_days` 允许范围；客户端会收到 `ErrorResponse{code="EXCEEDS_MAX_DELAY"}`（`transport.rs`）。
+- `delivery enqueued; awaiting client ack`：任务到期已投递到连接通道，等待客户端 ACK（`transport.rs`）。
+- `delivery failed, will retry`：当前连接不可用或路由失败，任务将按 `retry_delay_ms` 重试（`transport.rs`）。
+- `task acked; removed from storage`：收到客户端 ACK，持久化记录已清理（`transport.rs`）。
+- `client stream error`：客户端流出现错误（网络中断、协议错误），连接关闭（`transport.rs`）。
+- `stream closed`：客户端正常结束或错误后，连接注销（`transport.rs`）。
+
+排查建议：
+- 连接报 `UNAVAILABLE`：检查端口映射、`bind_addr` 是否 `0.0.0.0:7000`、`allowed_hosts` 是否包含来源 IP、云安全组/防火墙是否放行。
+- 任务无回调：确认是否有 `route registered`，并观察是否出现 `delivery failed, will retry`。
+- 任务被拒：根据 `ErrorResponse.code` 修正 `fire_at_epoch_ms` 或增大 `max_delay_days`。

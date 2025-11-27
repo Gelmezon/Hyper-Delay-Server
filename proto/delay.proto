@@ -45,7 +45,8 @@ message Registered {
 }
 
 message ErrorResponse {
-  string message = 1;
+  string code = 1;    // 机器可读错误码，例如 INVALID_FIRE_AT / EXCEEDS_MAX_DELAY / HOST_NOT_ALLOWED
+  string message = 2; // 人类可读错误信息
 }
 
 message ClientMessage {

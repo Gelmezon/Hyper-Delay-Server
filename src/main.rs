@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
     wheel.clone().start();
 
     // ConnectionHub 负责维护长连接、协议解析与回调分发
-    let hub = Arc::new(ConnectionHub::new(wheel.clone(), storage.clone()));
+    let hub = Arc::new(ConnectionHub::new(wheel.clone(), storage.clone(), app_config.clone()));
     spawn_ready_dispatcher(
         ready_rx,
         hub.registry(),

@@ -90,15 +90,17 @@ pub struct ConnectionHub {
     storage: Arc<SledStorage>,
     registry: ConnectionRegistry,
     id_seq: AtomicU64,
+    config: Arc<Config>,
 }
 
 impl ConnectionHub {
-    pub fn new(wheel: Arc<TimerWheel>, storage: Arc<SledStorage>) -> Self {
+    pub fn new(wheel: Arc<TimerWheel>, storage: Arc<SledStorage>, config: Arc<Config>) -> Self {
         Self {
             wheel,
             storage,
             registry: ConnectionRegistry::new(),
             id_seq: AtomicU64::new(0),
+            config,
         }
     }
 
@@ -115,6 +117,22 @@ impl ConnectionHub {
         req: delay::ScheduleRequest,
         connection_id: u64,
     ) -> Result<()> {
+        // 基本校验：禁止过去时间与超过最大允许延迟的任务
+        let now = crate::types::now_epoch_ms();
+        if req.fire_at_epoch_ms <= now {
+            warn!(connection_id, fire_at = req.fire_at_epoch_ms, now, "reject schedule: fire_at in the past");
+            // 当 proto 重新生成后，ErrorResponse 将包含 code+message 字段
+            let err = delay::ServerMessage { message: Some(delay::server_message::Message::Error(delay::ErrorResponse { code: "INVALID_FIRE_AT".into(), message: "fire_at in the past".into() })) };
+            let _ = self.registry.send_to_connection(connection_id, err).await;
+            bail!("fire_at in the past");
+        }
+        let max_ms = self.config.max_delay_ms();
+        if req.fire_at_epoch_ms - now > max_ms {
+            warn!(connection_id, fire_at = req.fire_at_epoch_ms, now, max_ms, "reject schedule: fire_at exceeds max delay");
+            let err = delay::ServerMessage { message: Some(delay::server_message::Message::Error(delay::ErrorResponse { code: "EXCEEDS_MAX_DELAY".into(), message: "fire_at exceeds max delay".into() })) };
+            let _ = self.registry.send_to_connection(connection_id, err).await;
+            bail!("fire_at exceeds max delay");
+        }
         let task = ScheduledTask::from_proto(&req, connection_id)?;
         self.registry
             .bind_route(task.route_key.clone(), connection_id)
@@ -214,9 +232,12 @@ impl delay::delay_scheduler_server::DelayScheduler for DelaySchedulerService {
         request: Request<tonic::Streaming<delay::ClientMessage>>,
     ) -> Result<Response<Self::ConnectStream>, Status> {
         if let Some(addr) = request.remote_addr() {
-            if !self.config.allows_ip(addr.ip()) {
+            let ip = addr.ip();
+            if !self.config.allows_ip(ip) {
+                warn!(peer = %ip, allowed = ?self.config.allowed_hosts, "reject connection: host not allowed");
                 return Err(Status::permission_denied("host not allowed"));
             }
+            info!(peer = %ip, "accept connection");
         }
         let connection_id = self.hub.next_connection_id();
         let (tx, rx) = mpsc::channel(self.config.connection_write_channel);

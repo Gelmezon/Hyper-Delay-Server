@@ -1,2 +1,4 @@
 /target
 /docker
+*.sh
+/data/db

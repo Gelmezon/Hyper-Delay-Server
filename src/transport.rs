@@ -11,7 +11,7 @@ use futures_core::Stream;
 use tokio::sync::{RwLock, mpsc};
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::pb::delay;
@@ -180,10 +180,11 @@ pub fn spawn_ready_dispatcher(
             };
             match registry.send_to_route(&task.route_key, message).await {
                 Ok(_) => {
+                    info!(task_id = %task.id, route = %task.route_key, fire_at = task.fire_at_epoch_ms, "delivery enqueued; awaiting client ack");
                     // wait for explicit ack from client to remove storage entry
                 }
                 Err(err) => {
-                    warn!(task_id = %task.id, route = %task.route_key, error = %err, "delivery failed, retry later");
+                    warn!(task_id = %task.id, route = %task.route_key, error = %err, "delivery failed, will retry");
                     let retry = Arc::new(task.cloned_with_delay(retry_delay));
                     wheel.schedule_task(retry).await;
                 }
@@ -223,6 +224,7 @@ impl delay::delay_scheduler_server::DelayScheduler for DelaySchedulerService {
             .registry()
             .register_connection(connection_id, tx)
             .await;
+        info!(connection_id, "stream connected");
         let mut inbound = request.into_inner();
         let hub = self.hub.clone();
         let registry = self.hub.registry();
@@ -231,30 +233,37 @@ impl delay::delay_scheduler_server::DelayScheduler for DelaySchedulerService {
                 match inbound.message().await {
                     Ok(Some(msg)) => match msg.message {
                         Some(delay::client_message::Message::Register(req)) => {
-                            if let Err(err) = hub.handle_register(req, connection_id).await {
-                                warn!(error = %err, "register handling failed");
+                            if let Err(err) = hub.handle_register(req.clone(), connection_id).await {
+                                warn!(connection_id, error = %err, route = %req.route_key, "register failed");
+                            } else {
+                                info!(connection_id, route = %req.route_key, "route registered");
                             }
                         }
                         Some(delay::client_message::Message::Schedule(req)) => {
-                            if let Err(err) = hub.process_schedule(req, connection_id).await {
-                                warn!(error = %err, "schedule processing failed");
+                            if let Err(err) = hub.process_schedule(req.clone(), connection_id).await {
+                                warn!(connection_id, error = %err, route = %req.route_key, "schedule failed");
+                            } else {
+                                info!(connection_id, route = %req.route_key, fire_at = req.fire_at_epoch_ms, payload_len = req.payload.len(), "task scheduled");
                             }
                         }
                         Some(delay::client_message::Message::Ack(req)) => {
-                            if let Err(err) = hub.handle_ack(req).await {
-                                warn!(error = %err, "ack handling failed");
+                            if let Err(err) = hub.handle_ack(req.clone()).await {
+                                warn!(connection_id, error = %err, ack_id = %req.id, "ack failed");
+                            } else {
+                                info!(connection_id, ack_id = %req.id, "task acked; removed from storage");
                             }
                         }
                         None => {}
                     },
                     Ok(None) => break,
                     Err(err) => {
-                        warn!(error = %err, "client stream error");
+                        warn!(connection_id, error = %err, "client stream error");
                         break;
                     }
                 }
             }
             registry.unregister_connection(connection_id).await;
+            info!(connection_id, "stream closed");
         });
         let stream = ReceiverStream::new(rx).map(Ok);
         let boxed: ConnectStream = Box::pin(stream);

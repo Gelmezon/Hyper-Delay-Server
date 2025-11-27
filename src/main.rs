@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
 
     let service = DelaySchedulerService::new(hub.clone(), app_config.clone());
     let addr: SocketAddr = app_config.bind_addr.parse().context("parse bind addr")?;
+    info!(%addr, "starting gRPC delay scheduler server");
     Server::builder()
         .add_service(delay::delay_scheduler_server::DelaySchedulerServer::new(
             service,

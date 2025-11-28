@@ -207,7 +207,10 @@ pub fn spawn_ready_dispatcher(
                     if task.attempts >= max_retries {
                         warn!(task_id = %task.id, route = %task.route_key, attempts = task.attempts, error = %err, "delivery failed; reached max retries, giving up");
                         // 删除持久化条目，避免无限堆积；后续可扩展为死信队列
-                        let _ = storage.remove_task(&task.id).await;
+                        match storage.remove_task(&task.id).await {
+                            Ok(_) => info!(task_id = %task.id, "task removed from storage after max retries"),
+                            Err(e) => error!(task_id = %task.id, error = %e, "failed to remove task from storage after max retries"),
+                        }
                     } else {
                         warn!(task_id = %task.id, route = %task.route_key, attempts = task.attempts, error = %err, next_attempt = task.attempts + 1, "delivery failed; will retry");
                         let retry = Arc::new(task.cloned_with_delay(retry_delay));

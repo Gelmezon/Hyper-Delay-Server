@@ -54,6 +54,7 @@ pub struct ScheduledTask {
     pub payload: Bytes,
     pub compression: Compression,
     pub route_key: String,
+    pub attempts: u32, // 已尝试投递次数（成功投递前递增）
 }
 
 impl ScheduledTask {
@@ -74,6 +75,7 @@ impl ScheduledTask {
             payload: Bytes::from(req.payload.clone()),
             compression: Compression::from(req.compression()),
             route_key,
+            attempts: 0,
         })
     }
 
@@ -84,6 +86,7 @@ impl ScheduledTask {
             payload: self.payload.clone().to_vec(),
             compression: self.compression.clone(),
             route_key: self.route_key.clone(),
+            attempts: self.attempts,
         }
     }
 
@@ -95,6 +98,7 @@ impl ScheduledTask {
             payload: self.payload.clone(),
             compression: self.compression.clone(),
             route_key: self.route_key.clone(),
+            attempts: self.attempts + 1,
         }
     }
 }
@@ -107,6 +111,8 @@ pub struct PersistedTask {
     pub payload: Vec<u8>,
     pub compression: Compression,
     pub route_key: String,
+    #[serde(default)]
+    pub attempts: u32,
 }
 
 impl PersistedTask {
@@ -117,6 +123,7 @@ impl PersistedTask {
             payload: Bytes::from(self.payload),
             compression: self.compression,
             route_key: self.route_key,
+            attempts: self.attempts,
         }
     }
 

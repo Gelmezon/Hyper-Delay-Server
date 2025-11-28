@@ -180,6 +180,8 @@ pub fn spawn_ready_dispatcher(
     registry: ConnectionRegistry,
     wheel: Arc<TimerWheel>,
     retry_delay_ms: u64,
+    max_retries: u32,
+    storage: Arc<SledStorage>,
 ) {
     let retry_delay = Duration::from_millis(retry_delay_ms);
     tokio::spawn(async move {
@@ -202,9 +204,15 @@ pub fn spawn_ready_dispatcher(
                     // wait for explicit ack from client to remove storage entry
                 }
                 Err(err) => {
-                    warn!(task_id = %task.id, route = %task.route_key, error = %err, "delivery failed, will retry");
-                    let retry = Arc::new(task.cloned_with_delay(retry_delay));
-                    wheel.schedule_task(retry).await;
+                    if task.attempts >= max_retries {
+                        warn!(task_id = %task.id, route = %task.route_key, attempts = task.attempts, error = %err, "delivery failed; reached max retries, giving up");
+                        // 删除持久化条目，避免无限堆积；后续可扩展为死信队列
+                        let _ = storage.remove_task(&task.id).await;
+                    } else {
+                        warn!(task_id = %task.id, route = %task.route_key, attempts = task.attempts, error = %err, next_attempt = task.attempts + 1, "delivery failed; will retry");
+                        let retry = Arc::new(task.cloned_with_delay(retry_delay));
+                        wheel.schedule_task(retry).await;
+                    }
                 }
             }
         }

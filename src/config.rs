@@ -27,6 +27,9 @@ pub struct Config {
     #[serde(default = "default_max_delay_days")]
     // 允许的最大延迟天数（默认 30 天），用于限制过远的 fire_at，避免资源占用与异常数据
     pub max_delay_days: u64,
+    #[serde(default = "default_max_delivery_retries")]
+    // 投递失败最大重试次数（超过后不再重试，任务可选择进入死信处理，当前实现仅日志）
+    pub max_delivery_retries: u32,
     #[serde(default = "default_allowed_hosts")]
     // 允许连接的来源 IP 白名单（字符串形式），不在列表将被拒绝
     pub allowed_hosts: Vec<String>,
@@ -81,6 +84,9 @@ fn default_max_delay_days() -> u64 {
     30
 }
 
+fn default_max_delivery_retries() -> u32 {
+    10
+}
 fn default_allowed_hosts() -> Vec<String> {
     vec!["127.0.0.1".into(), "::1".into()]
 }

@@ -67,5 +67,6 @@ message ServerMessage {
 }
 
 service DelayScheduler {
-  rpc Connect(stream ClientMessage) returns (stream ServerMessage);
+  rpc Connect(stream 
+  ) returns (stream ServerMessage);
 }

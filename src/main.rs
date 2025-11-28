@@ -50,6 +50,8 @@ async fn main() -> anyhow::Result<()> {
         hub.registry(),
         wheel.clone(),
         app_config.retry_delay_ms,
+        app_config.max_delivery_retries,
+        storage.clone(),
     );
 
     let service = DelaySchedulerService::new(hub.clone(), app_config.clone());

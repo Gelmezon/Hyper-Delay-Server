@@ -46,8 +46,32 @@ cargo run --release
 | `tick_ms` | 时间轮 tick 间隔，过小影响 CPU，过大影响延迟 | `10` |
 | `ready_channel_capacity` | 时间轮 ready 队列容量 | `2048` |
 | `connection_write_channel` | 每条连接的发包队列容量 | `256` |
-| `retry_delay_ms` | 发送失败后的重试延迟 | `1000` |
+| `retry_delay_ms` | 发送失败后的基础重试延迟（毫秒） | `1000` |
+| `max_delay_days` | 允许的最大调度延迟（天）超过拒绝 | `30` |
+| `max_delivery_retries` | 单个任务投递失败最大重试次数（超限进入放弃/未来可入死信队列） | `10` |
 | `allowed_hosts` | 允许访问的 IP 列表；为空时默认 `["127.0.0.1","::1"]` | - |
+
+完整示例：
+
+```json
+{
+  "data_dir": "data/db",
+  "bind_addr": "0.0.0.0:7000",              // 容器/服务器监听地址
+  "tick_ms": 10,                            // 时间轮推进间隔
+  "ready_channel_capacity": 2048,           // ready 队列容量
+  "connection_write_channel": 256,          // 单连接出站队列容量
+  "retry_delay_ms": 1000,                   // 投递失败基础重试延迟(ms)
+  "max_delay_days": 30,                     // 最长调度延迟天数
+  "max_delivery_retries": 10,               // 投递失败最大重试次数
+  "allowed_hosts": ["127.0.0.1", "47.107.46.118", "::1"] // 白名单 IP
+}
+```
+
+运行时也可通过环境变量指定：
+
+```bash
+HYPER_DELAY_CONFIG=/etc/hyper-delay/config.json ./hyper-delay-server
+```
 
 在容器/多机部署时，可通过环境变量 `HYPER_DELAY_CONFIG=/path/to/config.json` 指向定制配置。
 
@@ -209,6 +233,8 @@ public DelayGrpcClient delayClient() {
 - `reject schedule: fire_at exceeds max delay`：超过 `config.max_delay_days` 允许范围；客户端会收到 `ErrorResponse{code="EXCEEDS_MAX_DELAY"}`（`transport.rs`）。
 - `delivery enqueued; awaiting client ack`：任务到期已投递到连接通道，等待客户端 ACK（`transport.rs`）。
 - `delivery failed, will retry`：当前连接不可用或路由失败，任务将按 `retry_delay_ms` 重试（`transport.rs`）。
+- `delivery failed; will retry`（带 attempts 字段）：「attempts=X next_attempt=Y」表示已失败 X 次尚未超过上限，将在 Y 次时再次尝试；由配置 `max_delivery_retries` 控制最大次数（默认 10）。
+- `delivery failed; reached max retries, giving up`：已达到或超过最大重试次数，任务不再进入时间轮；当前实现直接删除持久化记录，可扩展为进入死信队列以供人工或异步补偿。
 - `task acked; removed from storage`：收到客户端 ACK，持久化记录已清理（`transport.rs`）。
 - `client stream error`：客户端流出现错误（网络中断、协议错误），连接关闭（`transport.rs`）。
 - `stream closed`：客户端正常结束或错误后，连接注销（`transport.rs`）。
@@ -217,3 +243,65 @@ public DelayGrpcClient delayClient() {
 - 连接报 `UNAVAILABLE`：检查端口映射、`bind_addr` 是否 `0.0.0.0:7000`、`allowed_hosts` 是否包含来源 IP、云安全组/防火墙是否放行。
 - 任务无回调：确认是否有 `route registered`，并观察是否出现 `delivery failed, will retry`。
 - 任务被拒：根据 `ErrorResponse.code` 修正 `fire_at_epoch_ms` 或增大 `max_delay_days`。
+- 频繁重试：检查消费端是否未注册 `route_key` 或连接断开；评估是否调高 `max_delivery_retries` 或实现死信队列。
+
+## TODO 死信处理（Dead Letter Queue，DLQ）
+
+当任务多次投递失败（达到 `max_delivery_retries`）或出现不可恢复错误（如永久路由缺失）时，直接删除会丢失诊断线索。可以引入“死信队列”存储失败任务，便于后续人工排查或二次补偿。
+
+### 设计目标
+1. 保留失败任务的上下文（payload、压缩方式、原计划触发时间、失败次数、最后错误原因）。
+2. 支持查询、分页浏览与筛选（按 route_key、时间范围、错误码）。
+3. 支持单条或批量重新入轮（Requeue）以及彻底删除（Delete）。
+4. 可设定最大保留时长/数量（TTL + size）防止无限膨胀。
+
+### Sled 存储结构
+- 新增树（Tree）名：`dead_letters`
+- Key：`<uuid>`（任务原始 id）
+- Value（JSON 或 bincode 序列化）：
+  ```json
+  {
+    "id": "uuid",
+    "route_key": "string",
+    "payload": "base64",      // 原始或压缩后字节
+    "compression": "none|lz4",
+    "original_fire_at_ms": 1700000000000,
+    "attempts": 11,
+    "last_error": "connection closed",
+    "created_at_ms": 1700000100000,
+    "dropped_at_ms": 1700000200000
+  }
+  ```
+
+### 接入点（集成流程）
+投递失败时（`spawn_ready_dispatcher` 内）：
+- 若 `attempts >= max_delivery_retries` → 写入 DLQ（包含 `last_error`），日志记录 `delivery failed; reached max retries, giving up`。
+- 不再重新入时间轮。
+
+### 重新入轮策略（Requeue）
+1. 读取 DLQ 记录 → 构建新的 `ScheduledTask`：
+   - `fire_at_epoch_ms` = `new_fire_at_ms`（由客户端或管理界面指定）。
+   - `attempts` 重置为 0 或保留历史（可配置）。
+2. 写入正常任务持久化树并入时间轮。
+3. 从 DLQ 删除原记录；记录日志 `dead_letter requeued` 并增加指标。
+
+### 指标与监控
+- `dlq_size`：当前死信任务数量。
+- `dlq_requeue_count`：累计重新投递次数。
+- `dlq_drop_count`：累计死亡（进入 DLQ）次数。
+- 可暴露为 Prometheus 指标，并以 route_key 分标签。
+
+### 清理与保留策略
+- TTL：后台定时扫描 `dropped_at_ms + ttl_ms < now` 的记录并自动删除。
+- Max Size：超过阈值（例如 1e6）时按最旧 `dropped_at_ms` 顺序淘汰。
+  - 可维护一个次级索引（例如另一个 Tree 或在 value 中冗余）以加速过期清理。
+
+### 安全与访问控制
+- 管理接口（DelayAdmin）可单独端口或加鉴权（token / mTLS）。
+- 防止批量 Requeue 造成突发高载：加入速率限制或批处理窗口。
+
+### 增强
+- 死信记录自动分类：根据 `last_error` 聚合统计。
+- 批量重试策略：支持一次性重试某 route_key 的全部死信。
+- 导出功能：将 DLQ dump 为文件或发送到外部分析系统（ELK / ClickHouse）。
+

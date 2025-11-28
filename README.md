@@ -63,7 +63,7 @@ cargo run --release
   "retry_delay_ms": 1000,                   // 投递失败基础重试延迟(ms)
   "max_delay_days": 30,                     // 最长调度延迟天数
   "max_delivery_retries": 10,               // 投递失败最大重试次数
-  "allowed_hosts": ["127.0.0.1", "47.107.46.118", "::1"] // 白名单 IP
+  "allowed_hosts": ["127.0.0.1", "1.1.1.1", "::1"] // 白名单 IP
 }
 ```
 

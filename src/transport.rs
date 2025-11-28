@@ -233,12 +233,12 @@ impl DelaySchedulerService {
 
 #[tonic::async_trait]
 impl delay::delay_scheduler_server::DelayScheduler for DelaySchedulerService {
-    type ConnectStream = ConnectStream;
+    type ConnectStreamStream = ConnectStream;
 
-    async fn connect(
+    async fn connect_stream(
         &self,
         request: Request<tonic::Streaming<delay::ClientMessage>>,
-    ) -> Result<Response<Self::ConnectStream>, Status> {
+    ) -> Result<Response<Self::ConnectStreamStream>, Status> {
         if let Some(addr) = request.remote_addr() {
             let ip = addr.ip();
             if !self.config.allows_ip(ip) {
